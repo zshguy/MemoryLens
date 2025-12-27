@@ -1,0 +1,270 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>MemoryLens</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <link rel="stylesheet" href="/static/app.css"/>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">MemoryLens</div>
+    <div class="subtitle">Local memory image triage and graph exploration</div>
+  </header>
+
+  <main class="container">
+    <section class="card">
+      <h2>Upload memory image</h2>
+      <div class="muted">Choose a memory image. The app runs Volatility 3 plugins locally and generates an investigation graph.</div>
+
+      <div id="drop" class="drop">
+        <div class="drop-left">
+          <div class="drop-title">Drag & drop here</div>
+          <div class="drop-sub">or</div>
+          <input id="file" type="file" class="file" accept=".mem,.raw,.dmp,.img,application/octet-stream"/>
+        </div>
+        <div class="drop-right">
+          <div class="row" style="justify-content:flex-end; gap:10px; margin-bottom:10px; flex-wrap:wrap;">
+            <label class="muted" style="display:flex; align-items:center; gap:8px;">
+              Analysis profile
+              <select id="profile" class="select">
+                <option value="default">Default (fast triage)</option>
+                <option value="deep">Deep (more plugins, no heavy dumps)</option>
+                <option value="full" selected>Full (all plugins)</option>
+              </select>
+            </label>
+            <label class="muted" style="display:flex; align-items:center; gap:8px;">
+              <input id="includeHeavy" type="checkbox" checked /> Include heavy plugins
+            </label>
+            <label class="muted" style="display:flex; align-items:center; gap:8px;">
+              <input id="includeDumpfiles" type="checkbox" /> Enable DumpFiles (writes extracted files)
+            </label>
+          </div>
+          <button id="upload" class="btn">Upload & Analyze</button>
+          <button id="pickLocal" class="btn secondary" style="display:none;">Import local file (desktop)</button>
+        </div>
+      </div>
+
+      <div id="status" class="status info" style="margin-top:12px; display:none;">Idle</div>
+
+      <div id="progressWrap" class="progress-wrap" style="display:none;">
+        <div class="progress-row">
+          <div class="muted" id="progressText">0%</div>
+          <div class="muted" id="progressDetail"></div>
+        </div>
+        <div class="progress">
+          <div id="progressBar" class="progress-bar" style="width:0%;"></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Recent cases</h2>
+      <div id="cases" class="list muted">Loading...</div>
+    </section>
+  </main>
+
+<script>
+const fileEl = document.getElementById("file");
+const uploadBtn = document.getElementById("upload");
+const pickLocalBtn = document.getElementById("pickLocal");
+const profileEl = document.getElementById("profile");
+const includeHeavyEl = document.getElementById("includeHeavy");
+const includeDumpfilesEl = document.getElementById("includeDumpfiles");
+const dropEl = document.getElementById("drop");
+const statusEl = document.getElementById("status");
+const progressWrap = document.getElementById("progressWrap");
+const progressBar = document.getElementById("progressBar");
+const progressText = document.getElementById("progressText");
+const progressDetail = document.getElementById("progressDetail");
+
+function setStatus(msg, kind="info") {
+  statusEl.style.display = "block";
+  statusEl.className = "status " + kind;
+  statusEl.textContent = msg;
+}
+function setProgress(pct, detail="") {
+  progressWrap.style.display = "block";
+  const clamped = Math.max(0, Math.min(100, pct));
+  progressBar.style.width = clamped + "%";
+  progressText.textContent = clamped.toFixed(1) + "%";
+  progressDetail.textContent = detail || "";
+}
+function resetProgress() {
+  progressWrap.style.display = "none";
+  progressBar.style.width = "0%";
+  progressText.textContent = "0%";
+  progressDetail.textContent = "";
+}
+
+async function refreshCases() {
+  const r = await fetch("/api/cases");
+  const j = await r.json();
+  const arr = (j && j.cases) ? j.cases : [];
+  if (!arr.length) {
+    document.getElementById("cases").innerHTML = "<div class='muted'>No cases yet.</div>";
+    return;
+  }
+  document.getElementById("cases").innerHTML = arr.slice(0, 8).map(c => {
+    const when = c.created_at ? new Date(c.created_at).toLocaleString() : "";
+    const err = (c.errors && c.errors.length) ? `<span class="pill warn">${c.errors.length} error(s)</span>` : "";
+    return `<a class="case" href="/case/${c.case_id}">
+      <div class="case-title">Case ${c.case_id}</div>
+      <div class="case-sub">${when} ${err}</div>
+    </a>`;
+  }).join("");
+}
+
+function prevent(e){ e.preventDefault(); e.stopPropagation(); }
+["dragenter","dragover","dragleave","drop"].forEach(ev => {
+  dropEl.addEventListener(ev, prevent, false);
+});
+dropEl.addEventListener("drop", (e) => {
+  const dt = e.dataTransfer;
+  if (!dt || !dt.files || !dt.files.length) return;
+  fileEl.files = dt.files;
+}, false);
+
+async function legacyUpload(file) {
+  setStatus("Uploading (single request)...", "info");
+  const profile = profileEl.value || "default";
+  const includeHeavy = !!includeHeavyEl.checked;
+  const includeDumpfiles = !!includeDumpfilesEl.checked;
+
+  const fd = new FormData();
+  fd.append("memory", file, file.name);
+  fd.append("profile", profile);
+  fd.append("include_heavy", includeHeavy ? "1" : "0");
+  fd.append("include_dumpfiles", includeDumpfiles ? "1" : "0");
+  const r = await fetch("/api/upload", { method: "POST", body: fd });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || "Upload failed");
+  return j.case_id;
+}
+
+async function chunkedUpload(file, chunkSize=64*1024*1024) {
+  const profile = profileEl.value || "default";
+  const includeHeavy = !!includeHeavyEl.checked;
+  const includeDumpfiles = !!includeDumpfilesEl.checked;
+
+  setStatus("Initializing upload...", "info");
+  resetProgress();
+  setProgress(0, "Preparing session");
+
+  const init = await fetch("/api/upload/init", {
+    method: "POST",
+    headers: {"Content-Type":"application/json"},
+    body: JSON.stringify({
+      filename: file.name,
+      total_size: file.size,
+      chunk_size: chunkSize,
+      profile,
+      options: { include_heavy: includeHeavy, include_dumpfiles: includeDumpfiles }
+    })
+  });
+  const initJ = await init.json();
+  if (!init.ok) throw new Error(initJ.error || "init failed");
+  const caseId = initJ.case_id;
+  const cs = initJ.chunk_size || chunkSize;
+
+  const total = file.size;
+  let offset = 0;
+  let index = 0;
+  const totalChunks = Math.ceil(total / cs);
+
+  setStatus("Uploading (chunked)...", "info");
+
+  while (offset < total) {
+    const end = Math.min(total, offset + cs);
+    const blob = file.slice(offset, end);
+
+    const fd = new FormData();
+    fd.append("index", String(index));
+    fd.append("offset", String(offset));
+    fd.append("total", String(total));
+    fd.append("chunk", blob, file.name + ".part");
+
+    const r = await fetch(`/api/upload/chunk/${caseId}`, { method: "POST", body: fd });
+    const j = await r.json();
+    if (!r.ok) {
+      const msg = j.error || "chunk upload failed";
+      throw new Error(msg + (j.expected_offset !== undefined ? ` (expected_offset=${j.expected_offset})` : ""));
+    }
+
+    offset = end;
+    index += 1;
+
+    const pct = (offset / total) * 100;
+    setProgress(pct, `chunk ${index}/${totalChunks} (${(offset/1024/1024).toFixed(1)} / ${(total/1024/1024).toFixed(1)} MB)`);
+  }
+
+  setStatus("Finalizing upload...", "info");
+  const fin = await fetch(`/api/upload/complete/${caseId}`, { method: "POST" });
+  const finJ = await fin.json();
+  if (!fin.ok) throw new Error(finJ.error || "finalize failed");
+
+  setProgress(100, "Upload complete");
+  return finJ.case_id;
+}
+
+async function uploadAndAnalyze() {
+  const file = fileEl.files && fileEl.files[0];
+  if (!file) return;
+
+  try {
+    const useChunked = file.size > (200 * 1024 * 1024);
+    const caseId = useChunked ? await chunkedUpload(file) : await legacyUpload(file);
+    setStatus("Starting analysis...", "ok");
+    window.location.href = "/case/" + caseId;
+  } catch (e) {
+    setStatus("Error: " + (e.message || e), "error");
+    console.error(e);
+  }
+}
+uploadBtn.addEventListener("click", uploadAndAnalyze);
+
+async function importLocal() {
+  try {
+    if (!window.pywebview || !window.pywebview.api || !window.pywebview.api.pick_memory_file) {
+      setStatus("Desktop API not available.", "warn");
+      return;
+    }
+    setStatus("Pick a memory image...", "info");
+    const path = await window.pywebview.api.pick_memory_file();
+    if (!path) {
+      setStatus("No file selected.", "warn");
+      return;
+    }
+    setStatus("Importing local file (copying to case folder)...", "info");
+    resetProgress();
+    setProgress(0, "Copying file locally");
+    const profile = profileEl.value || "default";
+    const includeHeavy = !!includeHeavyEl.checked;
+    const includeDumpfiles = !!includeDumpfilesEl.checked;
+
+    const r = await fetch("/api/import_local", {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({
+        path,
+        profile,
+        options: { include_heavy: includeHeavy, include_dumpfiles: includeDumpfiles }
+      })
+    });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || "import failed");
+    setProgress(100, "Import complete");
+    window.location.href = "/case/" + j.case_id;
+  } catch (e) {
+    setStatus("Error: " + (e.message || e), "error");
+  }
+}
+pickLocalBtn.addEventListener("click", importLocal);
+
+window.addEventListener("load", () => {
+  if (window.pywebview && window.pywebview.api) pickLocalBtn.style.display = "inline-block";
+  refreshCases();
+});
+</script>
+</body>
+</html>

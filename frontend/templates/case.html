@@ -1,0 +1,500 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>MemoryLens - Case</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <link rel="stylesheet" href="/static/app.css"/>
+  <script src="https://unpkg.com/cytoscape@3.28.1/dist/cytoscape.min.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><a href="/" class="brandlink">MemoryLens</a></div>
+    <div class="subtitle">Case: <span id="caseId"></span></div>
+  </header>
+
+  <main class="container">
+    <section class="card">
+      <h2>Status</h2>
+      <div id="job" class="status info">Loading job status...</div>
+    </section>
+
+    <section class="grid">
+      <section class="card">
+        <h2>OS summary</h2>
+        <div id="os" class="kv"></div>
+        <div class="actions">
+          <a id="dlCase" class="btn secondary" href="#">Download case.json</a>
+          <a id="dlRaw" class="btn secondary" href="#">Download case_raw.json</a>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Top suspicious indicators</h2>
+        <div id="indicators" class="list"></div>
+      </section>
+    </section>
+
+    <section class="card">
+      <h2>Top scored processes</h2>
+      <div class="muted">Triage-oriented scoring (0-100) with explainable reasons. Review the rationale before making conclusions.</div>
+      <div id="scores" class="scores"></div>
+    </section>
+
+    <section class="card">
+      <h2>Graph</h2>
+      <div class="muted">Process parent/child edges + process-to-remote connection edges. Suspicious processes are highlighted.</div>
+      <div id="cy" class="graph"></div>
+    </section>
+
+    <section class="card">
+      <h2>Processes</h2>
+      <input id="filter" class="input" placeholder="Filter by name or PID (e.g., lsass or 1234)" />
+      <div id="procs" class="table"></div>
+    </section>
+
+    <section class="card">
+      <h2>Command lines</h2>
+      <div id="cmdlines" class="table"></div>
+    </section>
+
+    <section class="card">
+      <h2>Loaded modules (dlllist)</h2>
+      <input id="dllFilter" class="input" placeholder="Filter modules by PID, name, or path" />
+      <div id="dlls" class="table"></div>
+    </section>
+
+    <section class="card">
+      <h2>Handles</h2>
+      <input id="handleFilter" class="input" placeholder="Filter handles by PID, type, or name (trimmed view)" />
+      <div id="handles" class="table"></div>
+    </section>
+
+    <section class="card">
+      <h2>Services (registry-derived)</h2>
+      <div id="services" class="table"></div>
+    </section>
+
+    <section class="card">
+      <h2>All plugin outputs</h2>
+      <div class="muted">Browse rows from any executed Volatility plugin. Use this for deep dive and validation.</div>
+      <div class="row" style="margin-top:10px; gap:10px; flex-wrap:wrap;">
+        <select id="pluginSelect" class="select" style="min-width:340px;"></select>
+        <input id="pluginFilter" class="input" placeholder="Filter current plugin rows" style="flex:1; min-width:260px;" />
+        <a id="dlPluginStdout" class="btn secondary" href="#" style="display:none;">stdout</a>
+        <a id="dlPluginStderr" class="btn secondary" href="#" style="display:none;">stderr</a>
+      </div>
+      <div id="pluginMeta" class="muted small" style="margin-top:8px;"></div>
+      <div id="pluginTable" class="table" style="margin-top:10px;"></div>
+    </section>
+
+    <section class="card">
+      <h2>Network connections</h2>
+      <div id="nets" class="table"></div>
+    </section>
+
+    <section class="card">
+      <h2>Errors</h2>
+      <div id="errors" class="list"></div>
+    </section>
+  </main>
+
+<script>
+const CASE_ID = "{{ case_id }}";
+document.getElementById("caseId").textContent = CASE_ID;
+
+document.getElementById("dlCase").href = "/download/" + CASE_ID + "/case.json";
+document.getElementById("dlRaw").href = "/download/" + CASE_ID + "/case_raw.json";
+
+const jobEl = document.getElementById("job");
+const osEl = document.getElementById("os");
+const indEl = document.getElementById("indicators");
+const scoresEl = document.getElementById("scores");
+const procsEl = document.getElementById("procs");
+const cmdlinesEl = document.getElementById("cmdlines");
+const dllsEl = document.getElementById("dlls");
+const handlesEl = document.getElementById("handles");
+const servicesEl = document.getElementById("services");
+const netsEl = document.getElementById("nets");
+const errorsEl = document.getElementById("errors");
+const pluginSelectEl = document.getElementById("pluginSelect");
+const pluginFilterEl = document.getElementById("pluginFilter");
+const pluginTableEl = document.getElementById("pluginTable");
+const dlPluginStdoutEl = document.getElementById("dlPluginStdout");
+const dlPluginStderrEl = document.getElementById("dlPluginStderr");
+
+const filterEl = document.getElementById("filter");
+const dllFilterEl = document.getElementById("dllFilter");
+const handleFilterEl = document.getElementById("handleFilter");
+
+let caseData = null;
+
+function setJob(msg, kind="info") {
+  jobEl.className = "status " + kind;
+  jobEl.textContent = msg;
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+function kv(obj) {
+  const rows = [];
+  for (const [k,v] of Object.entries(obj||{})) {
+    if (k === "raw") continue;
+    if (v === null || v === undefined || v === "") continue;
+    rows.push(`<div class="kv-row"><div class="kv-k">${escapeHtml(k)}</div><div class="kv-v">${escapeHtml(v)}</div></div>`);
+  }
+  if (!rows.length) return "<div class='muted'>No OS info parsed (plugin failure or unsupported image).</div>";
+  return rows.join("");
+}
+
+function table(rows, cols) {
+  if (!rows || !rows.length) return "<div class='muted'>No data.</div>";
+  const head = cols.map(c => `<th>${escapeHtml(c)}</th>`).join("");
+  const body = rows.map(r => {
+    return "<tr>" + cols.map(c => `<td>${escapeHtml(r[c]===undefined? "" : r[c])}</td>`).join("") + "</tr>";
+  }).join("");
+  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+function buildIndicators(data) {
+  const hits = (data.malfind_hits || []).length;
+  const susp = (data.graph && data.graph.nodes) ? data.graph.nodes.filter(n => n.type==="process" && n.suspicious).length : 0;
+  const errs = (data.errors || []).length;
+
+  const items = [];
+  items.push(`<div class="pill ${hits? "danger":"ok"}">malfind hits: ${hits}</div>`);
+  items.push(`<div class="pill ${susp? "danger":"ok"}">suspicious processes: ${susp}</div>`);
+  items.push(`<div class="pill ${errs? "warn":"ok"}">plugin errors: ${errs}</div>`);
+
+  indEl.innerHTML = items.join("");
+}
+
+function renderScores(data) {
+  const scores = (data.scores || []).slice(0, 12);
+  if (!scores.length) {
+    scoresEl.innerHTML = "<div class='muted'>No scores available (plugins may have failed or returned no data).</div>";
+    return;
+  }
+  scoresEl.innerHTML = scores.map(s => {
+    const reasons = (s.reasons || []).map(r => `<li>${escapeHtml(r)}</li>`).join("");
+    const cmd = s.cmdline ? `<div class="muted small">cmdline: ${escapeHtml(s.cmdline)}</div>` : "";
+    const pill = s.score >= 60 ? "danger" : (s.score >= 30 ? "warn" : "ok");
+    return `<div class="score-row">
+      <div class="score-head">
+        <div class="score-title">${escapeHtml(s.name)} (PID ${s.pid})</div>
+        <div class="pill ${pill}">score: ${s.score}</div>
+      </div>
+      ${cmd}
+      <ul class="score-reasons">${reasons || "<li class='muted'>No reasons.</li>"}</ul>
+    </div>`;
+  }).join("");
+}
+
+function renderProcesses(data, q="") {
+  const processes = (data.processes || []).slice();
+  const malPids = new Set();
+  for (const r of (data.malfind_hits || [])) {
+    const pid = r.PID || r.Pid || r.pid;
+    if (pid !== undefined && pid !== null) malPids.add(String(pid));
+  }
+  const filtered = processes.filter(p => {
+    if (!q) return true;
+    const pid = String(p.PID ?? p.Pid ?? p.pid ?? "");
+    const name = String(p.ImageFileName ?? p.Name ?? p.Process ?? "");
+    return pid.includes(q) || name.toLowerCase().includes(q.toLowerCase());
+  });
+
+  const cols = ["PID","PPID","ImageFileName","CreateTime","ExitTime","Threads","Handles","SessionId","Wow64"];
+  const norm = filtered.map(p => {
+    const pid = p.PID ?? p.Pid ?? p.pid;
+    const row = {...p, PID: pid, PPID: (p.PPID ?? p.Ppid ?? p.ppid)};
+    row.ImageFileName = row.ImageFileName ?? row.Name ?? row.Process ?? "";
+    row.__susp = malPids.has(String(pid));
+    return row;
+  });
+
+  const head = ["Suspicious"].concat(cols);
+  const body = norm.map(r => {
+    const susp = r.__susp ? "YES" : "";
+    const tds = [ `<td class="${r.__susp ? "cell-danger": ""}">${escapeHtml(susp)}</td>` ]
+      .concat(cols.map(c => `<td class="${r.__susp ? "cell-danger": ""}">${escapeHtml(r[c]===undefined? "" : r[c])}</td>`));
+    return "<tr>" + tds.join("") + "</tr>";
+  }).join("");
+
+  procsEl.innerHTML = `<table><thead><tr>${head.map(c=>`<th>${escapeHtml(c)}</th>`).join("")}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+function renderCmdlines(data) {
+  const rows = (data.cmdlines || []).map(r => {
+    return {
+      PID: r.PID ?? r.Pid ?? r.pid ?? "",
+      Process: r.Process ?? r.ImageFileName ?? r.Name ?? "",
+      CommandLine: r.CommandLine ?? r.CmdLine ?? r.cmdline ?? r.command_line ?? r.Args ?? r.Arguments ?? ""
+    };
+  });
+  cmdlinesEl.innerHTML = table(rows, ["PID","Process","CommandLine"]);
+}
+
+function renderDlls(data, q="") {
+  const rows = (data.dlls || []).map(r => {
+    return {
+      PID: r.PID ?? r.Pid ?? r.pid ?? "",
+      Base: r.Base ?? r.DllBase ?? "",
+      Size: r.Size ?? r.DllSize ?? "",
+      Name: r.Name ?? r.DllName ?? r.BaseDllName ?? "",
+      Path: r.Path ?? r.FullDllName ?? r.FullPath ?? ""
+    };
+  });
+
+  const filtered = rows.filter(r => {
+    if (!q) return true;
+    const hay = (String(r.PID)+" "+String(r.Name)+" "+String(r.Path)).toLowerCase();
+    return hay.includes(q.toLowerCase());
+  });
+
+  dllsEl.innerHTML = table(filtered, ["PID","Name","Path","Base","Size"]);
+}
+
+function renderHandles(data, q="") {
+  const rows = (data.handles || []).map(r => {
+    return {
+      PID: r.PID ?? r.Pid ?? r.pid ?? "",
+      Handle: r.HandleValue ?? r.Handle ?? r.handle ?? "",
+      Type: r.Type ?? r.ObjectType ?? "",
+      GrantedAccess: r.GrantedAccess ?? r.Access ?? "",
+      Name: r.Name ?? r.ObjectName ?? ""
+    };
+  });
+
+  const filtered = rows.filter(r => {
+    if (!q) return true;
+    const hay = (String(r.PID)+" "+String(r.Type)+" "+String(r.Name)).toLowerCase();
+    return hay.includes(q.toLowerCase());
+  }).slice(0, 2000);
+
+  handlesEl.innerHTML = table(filtered, ["PID","Type","Name","GrantedAccess","Handle"]);
+  if ((data.handles || []).length > filtered.length) {
+    handlesEl.innerHTML = `<div class="muted small">Showing ${filtered.length} of ${(data.handles||[]).length} rows (trimmed for UI).</div>` + handlesEl.innerHTML;
+  }
+}
+
+function renderServices(data) {
+  // Registry-derived service view (from PrintKey on HKLM\SYSTEM\CurrentControlSet\Services)
+  // The backend emits rows like {Key: ...Services\Name, Name: "ImagePath", Data: "..."}
+  const items = (data.services || []);
+  if (!items.length) {
+    servicesEl.innerHTML = "<div class='muted'>No data.</div>";
+    return;
+  }
+
+  const map = new Map(); // svc -> fields
+  for (const r of items) {
+    const key = String(r.Key || "");
+    const parts = key.split("\\");
+    const svc = parts.length ? parts[parts.length - 1] : key;
+    if (!map.has(svc)) map.set(svc, { Name: svc, ImagePath: "", Start: "", Type: "", DisplayName: "" });
+    const o = map.get(svc);
+    const n = String(r.Name || "").toLowerCase();
+    const d = r.Data;
+    if (n === "imagepath") o.ImagePath = d;
+    else if (n === "start") o.Start = d;
+    else if (n === "type") o.Type = d;
+    else if (n === "displayname") o.DisplayName = d;
+  }
+  const rows = Array.from(map.values()).sort((a,b) => String(a.Name).localeCompare(String(b.Name)));
+  servicesEl.innerHTML = table(rows, ["Name","DisplayName","Start","Type","ImagePath"]);
+}
+
+function renderNets(data) {
+  const rows = (data.nets || []).slice();
+  const cols = ["PID","Proto","LocalAddr","LocalPort","ForeignAddr","ForeignPort","State"];
+  const norm = rows.map(r => {
+    const pid = r.PID ?? r.Pid ?? r.pid;
+    return {
+      PID: pid,
+      Proto: r.Proto ?? r.Protocol ?? "",
+      LocalAddr: r.LocalAddr ?? r["Local Address"] ?? r.LocalAddress ?? "",
+      LocalPort: r.LocalPort ?? "",
+      ForeignAddr: r.ForeignAddr ?? r["Foreign Address"] ?? r.RemoteAddr ?? "",
+      ForeignPort: r.ForeignPort ?? r.RemotePort ?? "",
+      State: r.State ?? ""
+    };
+  });
+  netsEl.innerHTML = table(norm, cols);
+}
+
+function renderErrors(data) {
+  const errs = (data.errors || []);
+  if (!errs.length) {
+    errorsEl.innerHTML = "<div class='muted'>No errors reported.</div>";
+    return;
+  }
+  errorsEl.innerHTML = errs.map(e => {
+    return `<div class="err">
+      <div class="err-title">${escapeHtml(e.plugin || "unknown plugin")}: ${escapeHtml(e.error || "error")}</div>
+      ${e.stderr ? `<pre class="pre">${escapeHtml(e.stderr)}</pre>` : ""}
+    </div>`;
+  }).join("");
+}
+
+function renderPluginExplorer(data) {
+  const raw = data._raw || null;
+  const plugins = (data.plugins || []).slice();
+  plugins.sort();
+
+  // Populate select once
+  if (!pluginSelectEl.options.length) {
+    pluginSelectEl.innerHTML = plugins.map(p => `<option value="${escapeHtml(p)}">${escapeHtml(p)}</option>`).join("");
+  }
+
+  function getRows(pluginId) {
+    if (!raw || !raw.plugins || !raw.plugins[pluginId]) return [];
+    return raw.plugins[pluginId].rows || [];
+  }
+
+  function render(pluginId, q="") {
+    const rows = getRows(pluginId);
+    if (!rows.length) {
+      pluginTableEl.innerHTML = "<div class='muted'>No rows for this plugin (it may have returned nothing or failed).</div>";
+    } else {
+      // Build columns from union of first N row keys
+      const maxScan = Math.min(rows.length, 50);
+      const keySet = new Set();
+      for (let i = 0; i < maxScan; i++) {
+        const r = rows[i];
+        if (r && typeof r === 'object') {
+          Object.keys(r).forEach(k => keySet.add(k));
+        }
+      }
+      const cols = Array.from(keySet).slice(0, 14);
+
+      const filtered = !q ? rows : rows.filter(r => {
+        try {
+          const hay = JSON.stringify(r).toLowerCase();
+          return hay.includes(q.toLowerCase());
+        } catch {
+          return true;
+        }
+      });
+
+      const limited = filtered.slice(0, 1000);
+      pluginTableEl.innerHTML = table(limited, cols);
+      if (filtered.length > limited.length) {
+        pluginTableEl.innerHTML += `<div class='muted small' style='margin-top:8px;'>Showing first ${limited.length} of ${filtered.length} rows. Use filtering or export case_raw.json for full data.</div>`;
+      }
+    }
+
+    // Helpful links to raw stdout/stderr if present
+    const safe = pluginId.replaceAll("/", "_");
+    const stdoutPath = `/download/${CASE_ID}/raw/${safe}.stdout.txt`;
+    const stderrPath = `/download/${CASE_ID}/raw/${safe}.stderr.txt`;
+    dlPluginStdoutEl.href = stdoutPath;
+    dlPluginStderrEl.href = stderrPath;
+    dlPluginStdoutEl.style.display = "inline-block";
+    dlPluginStderrEl.style.display = "inline-block";
+  }
+
+  const selected = pluginSelectEl.value || (plugins[0] || "");
+  if (selected) render(selected, pluginFilterEl.value.trim());
+
+  pluginSelectEl.onchange = () => render(pluginSelectEl.value, pluginFilterEl.value.trim());
+  pluginFilterEl.oninput = () => render(pluginSelectEl.value, pluginFilterEl.value.trim());
+}
+
+function renderGraph(data) {
+  const nodes = (data.graph && data.graph.nodes) ? data.graph.nodes : [];
+  const edges = (data.graph && data.graph.edges) ? data.graph.edges : [];
+
+  const elements = [];
+  for (const n of nodes) {
+    elements.push({ data: { id: n.id, label: n.label, type: n.type, suspicious: !!n.suspicious } });
+  }
+  for (const e of edges) {
+    elements.push({ data: { id: e.id, source: e.source, target: e.target, type: e.type } });
+  }
+
+  cytoscape({
+    container: document.getElementById("cy"),
+    elements,
+    style: [
+      { selector: 'node', style: { 'label': 'data(label)', 'font-size': 10, 'text-wrap': 'wrap', 'text-max-width': 120,
+          'border-width': 1, 'border-color': '#334155', 'background-color': '#e2e8f0' } },
+      { selector: 'node[type="process"][suspicious = 1], node[type="process"][suspicious = true]',
+        style: { 'background-color': '#fecaca', 'border-color': '#991b1b', 'border-width': 2 } },
+      { selector: 'node[type="remote"]', style: { 'background-color': '#dbeafe', 'border-color': '#1e3a8a' } },
+      { selector: 'edge', style: { 'width': 1, 'line-color': '#94a3b8', 'target-arrow-shape': 'triangle',
+          'target-arrow-color': '#94a3b8', 'curve-style': 'bezier' } },
+      { selector: 'edge[type="connects_to"]', style: { 'line-style': 'dashed' } },
+    ],
+    layout: { name: 'cose', animate: false }
+  });
+}
+
+async function poll() {
+  const r = await fetch("/api/job");
+  const j = await r.json();
+  if (!j || j.case_id !== CASE_ID) {
+    setJob("No active job for this case. If analysis finished, results should be visible below.", "warn");
+  } else if (j.status === "running") {
+    const p = j.progress || {};
+    setJob(`Running ${p.plugin || ""} (${p.current||0}/${p.total||0})`, "info");
+  } else if (j.status === "queued") {
+    setJob("Queued...", "info");
+  } else if (j.status === "finished") {
+    setJob("Finished.", "ok");
+  } else if (j.status === "error") {
+    setJob("Error: " + (j.error || "unknown"), "error");
+  }
+  return j;
+}
+
+async function loadCase() {
+  const r = await fetch("/api/case/" + CASE_ID + "?include_raw=1");
+  const j = await r.json();
+  if (!r.ok) return;
+
+  caseData = j;
+  osEl.innerHTML = kv((j.summary && j.summary.os) ? j.summary.os : {});
+  buildIndicators(j);
+  renderScores(j);
+  renderProcesses(j, filterEl.value.trim());
+  renderCmdlines(j);
+  renderDlls(j, dllFilterEl.value.trim());
+  renderHandles(j, handleFilterEl.value.trim());
+  renderServices(j);
+  renderNets(j);
+  renderErrors(j);
+  renderPluginExplorer(j);
+  renderGraph(j);
+}
+
+filterEl.addEventListener("input", () => {
+  if (caseData) renderProcesses(caseData, filterEl.value.trim());
+});
+dllFilterEl.addEventListener("input", () => {
+  if (caseData) renderDlls(caseData, dllFilterEl.value.trim());
+});
+handleFilterEl.addEventListener("input", () => {
+  if (caseData) renderHandles(caseData, handleFilterEl.value.trim());
+});
+
+(async function init(){
+  await poll();
+  await loadCase();
+  setInterval(async () => {
+    const j = await poll();
+    if (j && j.case_id === CASE_ID && (j.status === "finished" || j.status === "error")) {
+      await loadCase();
+    }
+  }, 2000);
+})();
+</script>
+</body>
+</html>
