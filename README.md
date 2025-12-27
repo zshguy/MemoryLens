@@ -105,7 +105,7 @@ MemoryLens runs the Windows Volatility 3 plugin set (availability depends on the
 
 ### 1) Clone
 ```bash
-git clone https://github.com/<your-username>/MemoryLens.git
+git clone https://github.com/zshguy/MemoryLens.git
 cd MemoryLens
 ```
 
@@ -270,18 +270,13 @@ Your executable will be under:
 ## Security & Legal Notes
 
 - MemoryLens runs locally; no memory images are transmitted externally.
-- Symbol downloads occur via Volatility’s normal behavior (e.g., Microsoft symbol servers).
+- Symbol downloads occur via Volatility’s normal behavior (example: Microsoft symbol servers).
 - Use only on memory images you are legally authorized to analyze.
 
 ---
 
-## License
-
-Choose a license that matches your intent (MIT is common for security tooling). Add a `LICENSE` file to the repository accordingly.
-
----
 
 ## Author
 
-Ahmad  
-Defensive Security / DFIR
+Ahmad Khaled (zshguy)
+Cybersecurity / DFIR
