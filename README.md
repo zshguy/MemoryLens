@@ -1,5 +1,5 @@
-# MemoryLens By Ahmad Khaled (zshguy)
-Cybersecurity / DFIR
+# MemoryLens By Ahmad Khaled
+Offensive / Defensive Sec
 
 **MemoryLens** is a local-first memory forensics triage and visualization tool built on **Volatility 3**.  
 It runs fully on your own machine (no cloud) and provides a clean UI for exploring memory artifacts, suspicious behaviors, and correlated findings.
